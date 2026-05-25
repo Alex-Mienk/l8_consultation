@@ -69,6 +69,23 @@ typedef struct
 
 } queue_t;
 
+typedef struct
+{
+    struct sockaddr_in addr;
+    char name[MAX_NAME_LENGTH + 1];
+    int pebbles;
+    int logged;
+} beloved_t;
+
+typedef struct
+{
+    beloved_t Misha;
+    beloved_t Zosia;
+    int started;
+    queue_t queue;
+    pthread_mutex_t mutex;
+} gamestate_t;
+
 void queue_init(queue_t* queue)
 {
     pthread_mutex_init(&queue->mutex, NULL);
@@ -107,6 +124,74 @@ cast_message_t queue_pop(queue_t* queue)
     return message;
 }
 
+void gamestate_init(gamestate_t* game)
+{
+    game->Misha.name[0] = 0;
+    game->Zosia.name[0] = 0;
+    game->Misha.pebbles = 10;
+    game->Zosia.pebbles = 10;
+    game->Zosia.logged = 0;
+    game->Misha.logged = 0;
+    game->started = 0;
+    queue_init(&game->queue);
+}
+
+void add_beloved(beloved_t beloved, gamestate_t* game)
+{
+    if ((game->Misha.logged &&
+         !memcmp(&game->Misha.addr, (struct sockaddr_in*)&beloved.addr, sizeof(struct sockaddr_in))) ||
+        (game->Zosia.logged &&
+         !memcmp(&game->Zosia.addr, (struct sockaddr_in*)&beloved.addr, sizeof(struct sockaddr_in))))
+    {
+        printf("Rejecting the beloved because of self-love\n");
+        return;
+    }
+
+    if (!game->Misha.logged)
+    {
+        game->Misha = beloved;
+        printf("Misha joined\n");
+    }
+
+    else if (!game->Zosia.logged)
+    {
+        game->Zosia = beloved;
+        game->started = 1;
+        printf("Zosia joined\n");
+    }
+
+    else
+    {
+        printf("We like monogamy\n");
+    }
+}
+
+int is_logged_in(gamestate_t* game, struct sockaddr_in addr)
+{
+    if (game->Misha.logged && !memcmp(&game->Misha.addr, &addr, sizeof(addr)))
+    {
+        return 1;
+    }
+    else if (game->Zosia.logged && !memcmp(&game->Zosia.addr, &addr, sizeof(addr)))
+    {
+        return 1;
+    }
+    return 0;
+}
+
+int get_beloved_index(gamestate_t* game, struct sockaddr_in addr)
+{
+    if (game->Misha.logged && !memcmp(&game->Misha.addr, &addr, sizeof(addr)))
+    {
+        return 0;
+    }
+    else if (game->Zosia.logged && !memcmp(&game->Zosia.addr, &addr, sizeof(addr)))
+    {
+        return 1;
+    }
+    return -1;
+}
+
 void usage(char* name)
 {
     printf("%s <in_port>\n", name);
@@ -116,27 +201,39 @@ void usage(char* name)
 
 void* worker(void* args)
 {
-    queue_t* queue = args;
+    gamestate_t* game = args;
 
     while (1)
     {
-        cast_message_t message = queue_pop(queue);
+        cast_message_t message = queue_pop(&game->queue);
 
-        printf("[Cast] Someone casts <%s> onto <%hu>,<%hu>\n", spell_names[message.spell], message.X, message.Y);
+        pthread_mutex_lock(&game->mutex);
+        char* name;
+        if (message.padding == 0)
+        {
+            name = game->Misha.name;
+        }
+        else
+        {
+            name = game->Zosia.name;
+        }
+        printf("[Cast] <%s> casts <%s> onto <%hu>,<%hu>\n", name, spell_names[message.spell], message.X, message.Y);
+        pthread_mutex_unlock(&game->mutex);
+
+        // for that player implement the logic, some if statements
     }
 }
 
 void doServer(int fd)
 {
-    queue_t queue;
-
-    queue_init(&queue);
-
     pthread_t threads[THREAD_COUNT];
+
+    gamestate_t game;
+    gamestate_init(&game);
 
     for (int i = 0; i < THREAD_COUNT; i++)
     {
-        if (pthread_create(&threads[i], NULL, worker, &queue) < 0)
+        if (pthread_create(&threads[i], NULL, worker, &game) < 0)
             ERR("pthread_create");
     }
 
@@ -166,35 +263,58 @@ void doServer(int fd)
             message = (login_message_t*)buff;
             printf("[Login] Welcome, <%s>\n", message->name);
             count_message++;
+
+            beloved_t beloved;
+            beloved.addr = addr;
+            strcpy(beloved.name, message->name);
+            beloved.logged = 1;
+            beloved.pebbles = 10;
+            pthread_mutex_lock(&game.mutex);
+            add_beloved(beloved, &game);
+            pthread_mutex_unlock(&game.mutex);
         }
-
-        else if (buff[0] == 'c')
-        {
-            cast_message_t* message;
-            message = (cast_message_t*)buff;
-
-            message->spell = ntohs(message->spell);
-            message->X = ntohs(message->X);
-            message->Y = ntohs(message->Y);
-
-            if (message->spell >= SPELL_TYPES || message->X >= BOARD_SIZE || message->Y >= BOARD_SIZE)
-            {
-                printf("Error in the arguments, value out of range\n");
-                continue;
-            }
-
-            count_message++;
-            queue_push(&queue, message);
-        }
-
-        else if (buff[0] == 'q')
-        {
-            count_message++;
-        }
-
         else
         {
-            printf("Incorrect message type\n");
+            pthread_mutex_lock(&game.mutex);
+            if (!is_logged_in(&game, addr))
+            {
+                printf("Third wheel\n");
+                pthread_mutex_unlock(&game.mutex);
+                continue;
+            }
+            pthread_mutex_unlock(&game.mutex);
+            if (buff[0] == 'c')
+            {
+                cast_message_t* message;
+                message = (cast_message_t*)buff;
+
+                message->spell = ntohs(message->spell);
+                message->X = ntohs(message->X);
+                message->Y = ntohs(message->Y);
+                pthread_mutex_lock(&game.mutex);
+                message->padding = get_beloved_index(&game, addr);
+                pthread_mutex_unlock(&game.mutex);
+
+                if (message->spell >= SPELL_TYPES || message->X >= BOARD_SIZE || message->Y >= BOARD_SIZE)
+                {
+                    printf("Error in the arguments, value out of range\n");
+                    continue;
+                }
+
+                count_message++;
+                queue_push(&game.queue, message);
+            }
+
+            else if (buff[0] == 'q')
+            {
+                break;
+                count_message++;
+            }
+
+            else
+            {
+                printf("Incorrect message type\n");
+            }
         }
     }
     for (int i = 0; i < THREAD_COUNT; i++)
